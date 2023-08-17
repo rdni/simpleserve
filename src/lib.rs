@@ -37,6 +37,23 @@ pub mod errors;
 
 pub use server::prelude::*;
 
+
+/// A thread pool
+/// 
+/// This is used to execute functions/closures across multiple threads.
+/// 
+/// ## Example
+/// ```
+/// use sserve::ThreadPool;
+/// 
+/// let pool = ThreadPool::new(4);
+/// 
+/// for i in 0..20 {
+///     pool.execute(move || {
+///         println!("Job {}", i);
+///     });
+/// }
+/// ```
 pub struct ThreadPool {
     workers: Vec<Worker>,
     sender: Option<mpsc::Sender<Job>>,

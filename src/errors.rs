@@ -1,3 +1,5 @@
+//! Contains all errors used in the crate
+
 use std::{error::Error, fmt::Display};
 
 /// An error that occurs when a `Option` is unwrapped

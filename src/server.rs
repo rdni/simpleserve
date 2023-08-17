@@ -24,14 +24,25 @@
 //!     // server.start("127.0.0.1:7878");
 //! }
 
+use openssl::ssl::{
+        SslAcceptor,
+        SslMethod,
+        SslFiletype,
+        SslStream
+    };
 use std::{
     net::{
         TcpListener,
         TcpStream,
     },
     io::prelude::*,
-    path::{self, Path},
-    fs::File
+    path::{
+        self, 
+        Path, 
+        PathBuf
+    },
+    fs::File,
+    error::Error,
 };
 
 use crate::{ThreadPool, utils};
@@ -43,14 +54,24 @@ pub mod prelude {
         Bytes,
         Sendable,
         Handler,
+        ConnectionInfo,
+        ConnectionType
     };
 }
 
 pub trait Sendable: Send + Sync { // Can't have Sized, but should have it regardless
     fn render(&self) -> String;
-    fn send(&self, stream: &mut TcpStream) -> std::io::Result<()> {
-        stream.write_all(self.render().as_bytes())?;
-        Ok(())
+    fn send(&self, conn: &mut ConnectionInfo) -> Result<(), std::io::Error> {
+        match conn.connection_type() {
+            ConnectionType::Http => {
+                conn.stream().write_all(self.render().as_bytes())?;
+                return Ok(());
+            },
+            ConnectionType::Https(_, _) => {
+                conn.ssl_stream().write_all(self.render().as_bytes())?;
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -77,6 +98,7 @@ pub struct Webserver {
     routes: Vec<Handler>,
     thread_pool: ThreadPool,
     blacklisted_paths: Vec<path::PathBuf>,
+    connection_type: Option<ConnectionType>,
 }
 
 impl Webserver {
@@ -90,12 +112,17 @@ impl Webserver {
         Webserver {
             routes: vec![Handler::new("404", not_found_handler)],
             thread_pool: ThreadPool::new(thread_amount),
-            blacklisted_paths
+            blacklisted_paths,
+            connection_type: None
         }
     }
 
     pub fn blacklisted_paths(&self) -> &Vec<path::PathBuf> {
         &self.blacklisted_paths
+    }
+
+    pub fn connection_type(&self) -> &Option<ConnectionType> {
+        &self.connection_type
     }
 
     /// Adds a route to the webserver
@@ -166,7 +193,18 @@ impl Webserver {
     /// 
     /// # Panics
     /// Panics if the address is invalid
-    pub fn start(&self, addr: &str) -> ! {
+    pub fn start(&mut self, addr: &str, connection_type: ConnectionType) -> Result<(), Box<dyn Error>> {
+        if let ConnectionType::Http = connection_type {
+            self.connection_type = Some(connection_type);
+            self.start_http(addr)?;
+        } else {
+            self.connection_type = Some(connection_type);
+            self.start_https(addr)?;
+        }
+        Ok(())
+    }
+
+    fn start_http(&self, addr: &str) -> Result<(), Box<dyn Error>> {
         let listener = TcpListener::bind(addr).expect("Invalid address");
         println!("Server started on {}...", addr);
         for stream in listener.incoming() {
@@ -181,13 +219,40 @@ impl Webserver {
             let route_clone = self.routes.clone();
             let blacklisted_paths_clone = self.blacklisted_paths.clone();
     
+            let connection_info = ConnectionInfo::new(stream);
+
             self.thread_pool.execute(|| {
-                if let Err(e) = utils::handle_connection(stream, route_clone, blacklisted_paths_clone) {
+                if let Err(e) = utils::handle_connection(connection_info, route_clone, blacklisted_paths_clone) {
                     println!("Error handling connection: {}", e);
                 }
             });
         }
-        panic!("Server stopped");
+        Ok(())
+    }
+
+    fn start_https(&self, addr: &str) -> Result<(), Box<dyn Error>> {
+        let mut acceptor_builder = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
+        acceptor_builder.set_private_key_file("", SslFiletype::PEM).unwrap();
+        acceptor_builder.set_certificate_chain_file("/etc/passwd",).unwrap();
+        let acceptor = acceptor_builder.build();
+
+        let listener = TcpListener::bind(addr).expect("Invalid address");
+        println!("Server started on {}...", addr);
+        for stream in listener.incoming() {
+            let stream = acceptor.accept(stream?).expect("Failed to establish SSL connection");
+
+            let route_clone = self.routes.clone();
+            let blacklisted_paths_clone = self.blacklisted_paths.clone();
+
+            let connection_info = ConnectionInfo::new_ssl(stream, self.connection_type.as_ref().unwrap().key_path().clone(), self.connection_type.as_ref().unwrap().certificate().clone());
+    
+            self.thread_pool.execute(|| {
+                if let Err(e) = utils::handle_connection(connection_info, route_clone, blacklisted_paths_clone) {
+                    println!("Error handling connection: {}", e);
+                }
+            });
+        }
+        Ok(())
     }
 }
 
@@ -345,25 +410,100 @@ impl Sendable for Bytes {
         )
     }
 
-    fn send(&self, stream: &mut TcpStream) -> std::io::Result<()> {
-        stream.write_all(self.render().as_bytes())?;
-        stream.write_all(&self.content)?;
-        Ok(())
+    fn send(&self, conn: &mut ConnectionInfo) -> Result<(), std::io::Error> {
+        match conn.connection_type() {
+            ConnectionType::Http => {
+                conn.stream().write_all(self.render().as_bytes())?;
+                conn.stream().write_all(&self.content)?;
+                return Ok(());
+            },
+            ConnectionType::Https(_, _) => {
+                conn.ssl_stream().write_all(self.render().as_bytes())?;
+                conn.ssl_stream().write_all(&self.content)?;
+                return Ok(());
+            }
+        }
     }
 }
 
 pub struct RequestInfo<'a> {
-    pub stream: &'a TcpStream,
+    pub conn: &'a ConnectionInfo,
     pub route: &'a str,
     pub blacklisted_paths: &'a Vec<path::PathBuf>,
 }
 
 impl<'a> RequestInfo<'a> {
-    pub fn new(stream: &'a TcpStream, route: &'a str, blacklisted_paths: &'a Vec<path::PathBuf>) -> RequestInfo<'a> {
+    pub fn new(conn: &'a ConnectionInfo, route: &'a str, blacklisted_paths: &'a Vec<path::PathBuf>) -> RequestInfo<'a> {
         RequestInfo {
-            stream,
+            conn,
             route,
             blacklisted_paths,
         }
+    }
+}
+
+pub enum ConnectionType {
+    Http,
+    Https(
+        PathBuf,
+        PathBuf,
+    ),
+}
+
+impl ConnectionType {
+    pub fn key_path(&self) -> &PathBuf {
+        match self {
+            ConnectionType::Http => panic!("Connection is not HTTPS"),
+            ConnectionType::Https(key_path, _) => key_path,
+        }
+    }
+
+    pub fn certificate(&self) -> &PathBuf {
+        match self {
+            ConnectionType::Http => panic!("Connection is not HTTPS"),
+            ConnectionType::Https(_, certificate) => certificate,
+        }
+    }
+}
+
+pub struct ConnectionInfo {
+    connection_type: ConnectionType,
+    ssl_stream: Option<SslStream<TcpStream>>,
+    stream: Option<TcpStream>,
+}
+
+impl ConnectionInfo {
+    pub fn new(stream: TcpStream) -> ConnectionInfo {
+        ConnectionInfo {
+            connection_type: ConnectionType::Http,
+            ssl_stream: None,
+            stream: Some(stream),
+        }
+    }
+
+    pub fn new_ssl(stream: SslStream<TcpStream>, key_path: PathBuf, certificate: PathBuf) -> ConnectionInfo {
+        ConnectionInfo {
+            connection_type: ConnectionType::Https(key_path, certificate),
+            ssl_stream: Some(stream),
+            stream: None,
+        }
+    }
+
+    pub fn stream(&mut self) -> &mut TcpStream {
+        match &mut self.stream {
+            Some(v) => v,
+            None => panic!("Connection is not HTTP"),
+        }
+    }
+
+    pub fn ssl_stream(&mut self) -> &mut SslStream<TcpStream> {
+        match &mut self.ssl_stream {
+            Some(v) => v,
+            None => panic!("Connection is not HTTPS"),
+        }
+    }
+
+    pub fn connection_type(&self) -> &ConnectionType {
+        &self.connection_type
     }
 }
