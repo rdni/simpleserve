@@ -4,37 +4,32 @@
 //! 
 //! ## Example
 //! ```
-//! use simpleserve::server::{
+//! use simpleserve::{
 //!     Webserver,
 //!     Page,
 //!     Sendable,
 //!     HandlerFunction,
-//!     RequestInfo
+//!     RequestInfo,
+//!     ConnectionType
 //! };
 //! 
 //! fn main() {
-//!     let not_found: HandlerFunction = |_: &RequestInfo| -> Box<dyn Sendable + 'static> {
-//!          Box::new(Page::new(404, String::from("Not Found")))
-//!     };
 //!     let main_route: HandlerFunction = |_: &RequestInfo| -> Box<dyn Sendable + 'static> {
 //!          Box::new(Page::new(200, String::from("Hello World!")))
 //!     };
-//!     let mut server = Webserver::new(10, vec![], not_found);
+//!     let mut server = Webserver::new(10, vec![]);
 //!     server.add_route("/", main_route);
-//!     // server.start("127.0.0.1:7878");
+//!     server.start("127.0.0.1:7878", ConnectionType::Http, None, None);
 //! }
 
 use openssl::ssl::{
-        SslAcceptor,
-        SslMethod,
-        SslFiletype,
-        SslStream
-    };
+    SslAcceptor,
+    SslFiletype,
+    SslMethod,
+    Ssl,
+};
+use tokio_openssl::SslStream;
 use std::{
-    net::{
-        TcpListener,
-        TcpStream,
-    },
     io::prelude::*,
     path::{
         self, 
@@ -43,17 +38,27 @@ use std::{
     },
     fs::File,
     error::Error,
-    sync::mpsc::{
-        self, 
-        Receiver
-    },
+    thread,
+    time::Duration,
 };
 
 use crate::{
     ThreadPool, 
-    utils,
-    Job
+    utils
 };
+
+use tokio::{
+    self,
+    sync::mpsc,
+    net::{
+        TcpListener,
+        TcpStream
+    },
+    io::AsyncWriteExt,
+    runtime::Runtime,
+};
+
+use async_trait::async_trait;
 
 pub mod prelude {
     pub use crate::server::{
@@ -64,7 +69,9 @@ pub mod prelude {
         Handler,
         RequestInfo,
         ConnectionInfo,
-        ConnectionType
+        ConnectionType,
+        Task,
+        HandlerFunction
     };
     pub use crate::utils::{
         get_mime_type,
@@ -72,16 +79,18 @@ pub mod prelude {
     };
 }
 
+#[async_trait]
 pub trait Sendable: Send + Sync {
     fn render(&self) -> String;
-    fn send(&self, conn: &mut ConnectionInfo) -> Result<(), std::io::Error> {
+    async fn send(&self, conn: &mut ConnectionInfo) -> Result<(), std::io::Error> {
+        // Runtime already created in handle_connection, just use that
         match conn.connection_type() {
             ConnectionType::Http => {
-                conn.stream().write_all(self.render().as_bytes())?;
+                conn.stream().write_all(self.render().as_bytes()).await?;
                 return Ok(());
             },
-            ConnectionType::Https(_, _) => {
-                conn.ssl_stream().write_all(self.render().as_bytes())?;
+            ConnectionType::Https => {
+                conn.ssl_stream().write_all(self.render().as_bytes()).await?;
                 return Ok(());
             }
         }
@@ -98,13 +107,14 @@ pub type HandlerFunction = fn(&RequestInfo) -> Box<dyn Sendable>;
 /// 
 /// # Examples
 /// ```
-/// use simpleserve::server::{Webserver, Page, Sendable};
+/// use simpleserve::{
+///     Webserver,
+///     ConnectionType
+/// };
 /// 
 /// fn main() {
-///     let mut server = Webserver::new(10, vec![], |_| -> Box<dyn Sendable> {
-///         Box::new(Page::new(404, String::from("Not found")))
-/// });
-///     // server.start("127.0.0.1:7878");
+///     let mut server = Webserver::new(10, vec![]);
+///     server.start("127.0.0.1:7878", ConnectionType::Http, None, None);
 /// }
 /// ```
 pub struct Webserver {
@@ -112,8 +122,7 @@ pub struct Webserver {
     thread_pool: ThreadPool,
     blacklisted_paths: Vec<path::PathBuf>,
     connection_type: Option<ConnectionType>,
-    whitelist_enabled: bool,
-    receiver: Option<mpsc::Receiver<Job>>,
+    receiver: Option<mpsc::Receiver<Task>>,
 }
 
 impl Webserver {
@@ -123,13 +132,12 @@ impl Webserver {
     /// * `thread_amount` - The number of threads to use
     /// * `blacklisted_paths` - The paths (file paths) to not allow access to
     /// * `not_found_handler` - The handler for 404 errors
-    pub fn new(thread_amount: usize, blacklisted_paths: Vec<path::PathBuf>, not_found_handler: HandlerFunction) -> Webserver {
+    pub fn new(thread_amount: usize, blacklisted_paths: Vec<path::PathBuf>) -> Webserver {
         Webserver {
-            routes: vec![Handler::new("404", not_found_handler)],
+            routes: vec![Handler::new("404", utils::base_not_found_handler)],
             thread_pool: ThreadPool::new(thread_amount),
             blacklisted_paths,
             connection_type: None,
-            whitelist_enabled: false,
             receiver: None,
         }
     }
@@ -142,17 +150,13 @@ impl Webserver {
         &self.connection_type
     }
 
-    pub fn whitelist_enabled(&self) -> bool {
-        self.whitelist_enabled
-    }
-
-    pub fn set_whitelist_enabled(&mut self, enabled: bool) {
-        self.whitelist_enabled = enabled;
-    }
-
-    pub fn with_receiver(mut self, receiver: mpsc::Receiver<Job>) -> Webserver {
+    pub fn with_receiver(mut self, receiver: mpsc::Receiver<Task>) -> Webserver {
         self.receiver = Some(receiver);
         self
+    }
+
+    pub fn set_404_callback(&mut self, callback: HandlerFunction) {
+        self.routes[0] = Handler::new("404", callback);
     }
 
     /// Adds a route to the webserver
@@ -171,27 +175,24 @@ impl Webserver {
     ///     fs,
     ///     path::PathBuf
     /// };
-    /// use simpleserve::server::{
+    /// use simpleserve::{
     ///     Webserver,
     ///     Page,
     ///     Sendable,
-    ///     RequestInfo
+    ///     RequestInfo,
+    ///     ConnectionType
     /// };
     ///
     /// fn main() {
-    ///     let mut server = Webserver::new(10, vec![], not_found);
+    ///     let mut server = Webserver::new(10, vec![]);
     ///     server.add_route("/", main_route);
-    ///     // server.start("127.0.0.1:7878");
+    ///     server.start("127.0.0.1:7878", ConnectionType::Http, None, None);
     /// }
     ///
     ///
     /// fn main_route(request: &RequestInfo) -> Box<dyn Sendable> {
     ///     let contents = fs::read_to_string("index.html").expect("Error reading file");
     ///     Box::new(Page::new(200, contents))
-    /// }
-    /// 
-    /// fn not_found(_: &RequestInfo) -> Box<dyn Sendable> {
-    ///     Box::new(Page::new(404, String::from("Not found")))
     /// }
     pub fn add_route(&mut self, route: &str, handler: HandlerFunction) {
         if route.is_empty() {
@@ -216,6 +217,26 @@ impl Webserver {
         Ok(())
     }
 
+    async fn receive(&mut self) -> Option<Task> {
+        match self.receiver.take() {
+            Some(mut receiver) => {
+                match receiver.recv().await {
+                    Some(message) => {
+                        self.receiver = Some(receiver);
+                        return Some(message);
+                    },
+                    None => {
+                        println!("Receiver channel closed");
+                        return None;
+                    }
+                }
+            },
+            None => {
+                return None;
+            }
+        }
+    }
+
     /// Starts the webserver
     /// 
     /// # Arguments
@@ -223,65 +244,92 @@ impl Webserver {
     /// 
     /// # Panics
     /// Panics if the address is invalid
-    pub fn start(&mut self, addr: &str, connection_type: ConnectionType) -> Result<(), Box<dyn Error>> {
+    pub async fn start(&mut self, addr: &str, connection_type: ConnectionType, pk: Option<PathBuf>, sslc: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
         if let ConnectionType::Http = connection_type {
             self.connection_type = Some(connection_type);
-            self.start_http(addr)?;
-        } else {
-            self.connection_type = Some(connection_type);
-            self.start_https(addr)?;
+            self.start_http(addr).await?;
+        } else if let ConnectionType::Https = connection_type {
+            self.connection_type = Some(ConnectionType::Https);
+            self.start_https(addr, pk.unwrap(), sslc.unwrap()).await?;
         }
+        self.thread_pool.stop();
         Ok(())
     }
 
-    fn start_http(&self, addr: &str) -> Result<(), Box<dyn Error>> {
-        let listener = TcpListener::bind(addr).expect("Invalid address");
+    async fn start_http(&mut self, addr: &str) -> Result<(), Box<dyn Error>> {
+        let listener = TcpListener::bind(addr).await?;
         println!("Server started on {}...", addr);
-        for stream in listener.incoming() {
-            let stream = match stream {
-                Ok(v) => v,
-                Err(e) => {
-                    println!("Error processing TCP stream: {}", e);
-                    continue;
-                }
-            };
+        loop {
+            tokio::select! {
+                conn = listener.accept() => match conn {
+                    Ok((stream, _)) => {
+                        let route_clone = self.routes.clone();
+                        let blacklisted_paths_clone = self.blacklisted_paths.clone();
 
-            let route_clone = self.routes.clone();
-            let blacklisted_paths_clone = self.blacklisted_paths.clone();
-    
-            let connection_info = ConnectionInfo::new(stream);
+                        let connection_info = ConnectionInfo::new(stream);
 
-            self.thread_pool.execute(|| {
-                if let Err(e) = utils::handle_connection(connection_info, route_clone, blacklisted_paths_clone) {
-                    println!("Error handling connection: {}", e);
+                        self.thread_pool.execute(|| {
+                            let rt = Runtime::new().unwrap();
+                            rt.block_on(
+                                utils::handle_connection(connection_info, route_clone, blacklisted_paths_clone)
+                            ).unwrap();
+                        });
+                    },
+                    Err(e) => {
+                        println!("Error accepting connection: {}", e);
+                    }
+                },
+                msg = self.receive() => {
+                    match msg {
+                        Some(Task::Shutdown) => {
+                            println!("Shutting down server...");
+                            return Ok(());
+                        },
+                        None => {}
+                        _ => {
+                            println!("Received unknown message");
+                        }
+                    }
                 }
-            });
+            }
+            thread::sleep(Duration::from_millis(100));
         }
-        Ok(())
     }
 
-    fn start_https(&self, addr: &str) -> Result<(), Box<dyn Error>> {
+    async fn start_https(&self, addr: &str, private_key_file: PathBuf, ssl_certificate_file: PathBuf) -> Result<(), Box<dyn Error>> {
+        let listener = TcpListener::bind(addr).await?;
+
         let mut acceptor_builder = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
-        acceptor_builder.set_private_key_file("", SslFiletype::PEM).unwrap();
-        acceptor_builder.set_certificate_chain_file("/etc/passwd",).unwrap();
+        acceptor_builder.set_private_key_file(private_key_file, SslFiletype::PEM).unwrap();
+        acceptor_builder.set_certificate_chain_file(ssl_certificate_file).unwrap();
         let acceptor = acceptor_builder.build();
 
-        let listener = TcpListener::bind(addr).expect("Invalid address");
-        println!("Server started on {}...", addr);
-        for stream in listener.incoming() {
-            let stream = acceptor.accept(stream?).expect("Failed to establish SSL connection");
+        let ssl = Ssl::new(acceptor.context()).unwrap();
 
-            let route_clone = self.routes.clone();
-            let blacklisted_paths_clone = self.blacklisted_paths.clone();
+        tokio::select! {
+            conn = listener.accept() => match conn {
+                Ok((stream, _)) => {
+                    let stream = SslStream::new(ssl, stream).unwrap();
 
-            let connection_info = ConnectionInfo::new_ssl(stream, self.connection_type.as_ref().unwrap().key_path().clone(), self.connection_type.as_ref().unwrap().certificate().clone());
-    
-            self.thread_pool.execute(|| {
-                if let Err(e) = utils::handle_connection(connection_info, route_clone, blacklisted_paths_clone) {
-                    println!("Error handling connection: {}", e);
+                    let route_clone = self.routes.clone();
+                    let blacklisted_paths_clone = self.blacklisted_paths.clone();
+
+                    let connection_info = ConnectionInfo::new_ssl(stream);
+
+                    self.thread_pool.execute(|| {
+                        let rt = Runtime::new().unwrap();
+                                    
+                        rt.block_on(
+                            utils::handle_connection(connection_info, route_clone, blacklisted_paths_clone)
+                        ).unwrap()
+                    });
+                },
+                Err(e) => {
+                    println!("Error accepting connection: {}", e);
                 }
-            });
+            },
         }
+
         Ok(())
     }
 }
@@ -319,27 +367,25 @@ impl Handler {
 ///     fs,
 ///     path::PathBuf
 /// };
-/// use simpleserve::server::{
+/// use simpleserve::{
 ///     Webserver,
 ///     Page,
 ///     Sendable,
-///     RequestInfo
+///     RequestInfo,
+///     ConnectionType
 /// };
 ///
 /// fn main() {
-///     let mut server = Webserver::new(10, vec![], not_found);
+///     let mut server = Webserver::new(10, vec![]);
 ///     server.add_route("/", main_route);
-///     // server.start("127.0.0.1:7878");
+///     let connection_type = ConnectionType::Http;
+///     server.start("127.0.0.1:7878", connection_type, None, None);
 /// }
 ///
 ///
 /// fn main_route(_: &RequestInfo) -> Box<dyn Sendable> {
 ///     let contents = fs::read_to_string("index.html").expect("Error reading file");
 ///     Box::new(Page::new(200, contents))
-/// }
-/// 
-/// fn not_found(_: &RequestInfo) -> Box<dyn Sendable> {
-///     Box::new(Page::new(404, String::from("Not found")))
 /// }
 pub struct Page {
     status: u16,
@@ -371,19 +417,21 @@ impl Sendable for Page {
 ///     fs,
 ///     path::PathBuf
 /// };
-/// use simpleserve::server::{
+/// use simpleserve::{
 ///     Webserver,
 ///     Bytes,
 ///     Sendable,
 ///     RequestInfo,
-///     Page
+///     Page,
+///     ConnectionType
 /// };
 /// 
 /// fn main() {
-///    let mut server = Webserver::new(10, vec![], not_found);
+///    let mut server = Webserver::new(10, vec![]);
 ///    server.add_route("/", main_route);
 ///    server.add_route("/image.jpg", image_route);
-///    // server.start("127.0.0.1:7878");
+///    server.set_404_callback(not_found);
+///    server.start("127.0.0.1:7878", ConnectionType::Http, None, None);
 /// }
 /// 
 /// fn main_route(_: &RequestInfo) -> Box<dyn Sendable> {
@@ -430,6 +478,7 @@ impl Bytes {
     }
 }
 
+#[async_trait]
 impl Sendable for Bytes {
     fn render(&self) -> String {
         format!(
@@ -440,16 +489,16 @@ impl Sendable for Bytes {
         )
     }
 
-    fn send(&self, conn: &mut ConnectionInfo) -> Result<(), std::io::Error> {
+    async fn send(&self, conn: &mut ConnectionInfo) -> Result<(), std::io::Error> {
         match conn.connection_type() {
             ConnectionType::Http => {
-                conn.stream().write_all(self.render().as_bytes())?;
-                conn.stream().write_all(&self.content)?;
+                conn.stream().write_all(self.render().as_bytes()).await?;
+                conn.stream().write_all(&self.content).await?;
                 return Ok(());
             },
-            ConnectionType::Https(_, _) => {
-                conn.ssl_stream().write_all(self.render().as_bytes())?;
-                conn.ssl_stream().write_all(&self.content)?;
+            ConnectionType::Https => {
+                conn.ssl_stream().write_all(self.render().as_bytes()).await?;
+                conn.ssl_stream().write_all(&self.content).await?;
                 return Ok(());
             }
         }
@@ -472,30 +521,19 @@ impl<'a> RequestInfo<'a> {
     }
 }
 
+#[derive(Debug)]
+pub enum Task {
+    Connection(ConnectionInfo),
+    Shutdown,
+}
+
+#[derive(Debug)]
 pub enum ConnectionType {
     Http,
-    Https(
-        PathBuf,
-        PathBuf,
-    ),
+    Https,
 }
 
-impl ConnectionType {
-    pub fn key_path(&self) -> &PathBuf {
-        match self {
-            ConnectionType::Http => panic!("Connection is not HTTPS"),
-            ConnectionType::Https(key_path, _) => key_path,
-        }
-    }
-
-    pub fn certificate(&self) -> &PathBuf {
-        match self {
-            ConnectionType::Http => panic!("Connection is not HTTPS"),
-            ConnectionType::Https(_, certificate) => certificate,
-        }
-    }
-}
-
+#[derive(Debug)]
 pub struct ConnectionInfo {
     connection_type: ConnectionType,
     ssl_stream: Option<SslStream<TcpStream>>,
@@ -511,9 +549,9 @@ impl ConnectionInfo {
         }
     }
 
-    pub fn new_ssl(stream: SslStream<TcpStream>, key_path: PathBuf, certificate: PathBuf) -> ConnectionInfo {
+    pub fn new_ssl(stream: SslStream<TcpStream>) -> ConnectionInfo {
         ConnectionInfo {
-            connection_type: ConnectionType::Https(key_path, certificate),
+            connection_type: ConnectionType::Https,
             ssl_stream: Some(stream),
             stream: None,
         }

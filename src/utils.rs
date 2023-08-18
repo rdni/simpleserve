@@ -4,14 +4,9 @@
 
 
 use std::{
-    io::{
-        prelude::*,
-        BufReader,
-        BufRead
-    },
     path, 
     error::Error,
-    fs::{self, File},
+    fs
 };
 
 use crate::errors;
@@ -26,6 +21,11 @@ use crate::server::{
 };
 
 use regex::Regex;
+use tokio::io::{
+    BufReader,
+    AsyncBufReadExt,
+    AsyncWriteExt,
+};
 
 pub fn get_mime_type(extension: &str) -> &'static str {
     match extension {
@@ -41,21 +41,22 @@ pub fn get_mime_type(extension: &str) -> &'static str {
     }
 }
 
-pub fn handle_connection(conn: ConnectionInfo, routes: Vec<Handler>, blacklisted_paths: Vec<path::PathBuf>) -> Result<(), Box<dyn Error>> {
+pub async fn handle_connection(conn: ConnectionInfo, routes: Vec<Handler>, blacklisted_paths: Vec<path::PathBuf>) -> Result<(), Box<dyn Error>> {
     match conn.connection_type() {
         ConnectionType::Http => {
-            handle_http_connection(conn, routes, blacklisted_paths)
+            handle_http_connection(conn, routes, blacklisted_paths).await?;
         },
-        ConnectionType::Https(_, _) => {
-            handle_https_connection(conn, routes, blacklisted_paths)
+        ConnectionType::Https => {
+            handle_https_connection(conn, routes, blacklisted_paths).await?;
         }
     }
+    Ok(())
 }
 
-fn handle_http_connection(mut conn: ConnectionInfo, routes: Vec<Handler>, blacklisted_paths: Vec<path::PathBuf>) -> Result<(), Box<dyn Error>> {
+async fn handle_http_connection(mut conn: ConnectionInfo, routes: Vec<Handler>, blacklisted_paths: Vec<path::PathBuf>) -> Result<(), Box<dyn Error>> {
     let buf_reader = BufReader::new(conn.stream());
-    let request_line = match buf_reader.lines().next() {
-        Some(line) => line?,
+    let request_line = match buf_reader.lines().next_line().await? {
+        Some(line) => line,
         None => {
             println!("No request line found");
             return Err(Box::new(errors::OptionUnwrapError {}));
@@ -88,15 +89,15 @@ fn handle_http_connection(mut conn: ConnectionInfo, routes: Vec<Handler>, blackl
         }
     }
 
-    response.send(&mut conn)?;
-    conn.stream().flush()?;
+    response.send(&mut conn).await?;
+    conn.stream().flush().await?;
     Ok(())
 }
 
-fn handle_https_connection(mut conn: ConnectionInfo, routes: Vec<Handler>, blacklisted_paths: Vec<path::PathBuf>) -> Result<(), Box<dyn Error>> {
+async fn handle_https_connection(mut conn: ConnectionInfo, routes: Vec<Handler>, blacklisted_paths: Vec<path::PathBuf>) -> Result<(), Box<dyn Error>> {
     let buf_reader = BufReader::new(conn.ssl_stream());
-    let request_line = match buf_reader.lines().next() {
-        Some(line) => line?,
+    let request_line = match buf_reader.lines().next_line().await? {
+        Some(line) => line,
         None => {
             println!("No request line found");
             return Err(Box::new(errors::OptionUnwrapError {}));
@@ -129,8 +130,8 @@ fn handle_https_connection(mut conn: ConnectionInfo, routes: Vec<Handler>, black
         }
     }
 
-    response.send(&mut conn)?;
-    conn.stream().flush()?;
+    response.send(&mut conn).await?;
+    conn.stream().flush().await?;
 
     Ok(())
 }
@@ -141,34 +142,18 @@ pub fn base_file_handler(request: &RequestInfo) -> Box<dyn Sendable> {
         ConnectionType::Http => {
             handle_http_file(request)
         },
-        ConnectionType::Https(_, _) => {
+        ConnectionType::Https => {
             handle_https_file(request)
         }
     }
 }
 
 fn handle_http_file(request: &RequestInfo) -> Box<dyn Sendable> {
-    let mut file = match File::open(&request.route[1..]) {
-        Ok(file) => file,
-        Err(_) => {
-            return Box::new(Page::new(404, String::from("Not found")));
-        }
-    };
-    let mut contents = String::new();
-    file.read_to_string(&mut contents).unwrap();
-    Box::new(Bytes::new(200, contents).unwrap())
+    Box::new(Bytes::new(200, &request.route[1..]).unwrap())
 }
 
 fn handle_https_file(request: &RequestInfo) -> Box<dyn Sendable> {
-    let mut file = match File::open(&request.route[1..]) {
-        Ok(file) => file,
-        Err(_) => {
-            return Box::new(Page::new(404, String::from("Not found")));
-        }
-    };
-    let mut contents = String::new();
-    file.read_to_string(&mut contents).unwrap();
-    Box::new(Bytes::new(200, contents).unwrap())
+    Box::new(Bytes::new(200, &request.route).unwrap())
 }
 
 pub fn base_not_found_handler(request: &RequestInfo) -> Box<dyn Sendable> {

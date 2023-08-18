@@ -6,6 +6,9 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+async-trait = "0.1.73"
 openssl = "0.10.56"
 regex = "1.9.3"
+tokio = { version = "1", features = ["full"] }
+tokio-openssl = "0.6.3"
 urlencoding = "2.1.3"

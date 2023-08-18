@@ -14,13 +14,10 @@
 //! };
 //! 
 //! fn main() {
-//!     let not_found: HandlerFunction = |_: &RequestInfo| -> Box<dyn Sendable + 'static> {
-//!        Box::new(Page::new(404, String::from("Not Found")))
-//!     };
 //!     let main_route: HandlerFunction = |_: &RequestInfo| -> Box<dyn Sendable + 'static> {
 //!        Box::new(Page::new(200, String::from("Hello World!")))
 //!     };
-//!     let mut server = Webserver::new(10, vec![], not_found);
+//!     let mut server = Webserver::new(10, vec![]);
 //!     server.add_route("/", main_route);
 //!     // server.start("127.0.0.1:7878");
 //! }
@@ -78,8 +75,8 @@ impl ThreadPool {
 
         let mut workers = Vec::with_capacity(size);
 
-        for id in 0..size {
-            workers.push(Worker::new(id, Arc::clone(&receiver)));
+        for _ in 0..size {
+            workers.push(Worker::new(Arc::clone(&receiver)));
         }
 
         ThreadPool {
@@ -107,6 +104,11 @@ impl ThreadPool {
             .send(job)
             .expect("Failed to send job");
     }
+
+    pub fn stop(&mut self) {
+        drop(self.sender.take());
+        println!("Server stopped")
+    }
 }
 
 impl Drop for ThreadPool {
@@ -114,8 +116,6 @@ impl Drop for ThreadPool {
         drop(self.sender.take());
 
         for worker in &mut self.workers {
-            println!("Shutting down worker {}", worker.id);
-
             if let Some(thread) = worker.thread.take() {
                 thread.join().unwrap();
             }
@@ -124,12 +124,11 @@ impl Drop for ThreadPool {
 }
 
 struct Worker {
-    id: usize,
     thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Worker {
-    fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Job>>>) -> Worker {
+    fn new( receiver: Arc<Mutex<mpsc::Receiver<Job>>>) -> Worker {
         let thread = thread::spawn(move || loop {
             let message = receiver.lock().unwrap().recv();
 
@@ -144,7 +143,6 @@ impl Worker {
         });
 
         Worker {
-            id,
             thread: Some(thread),
         }
     }
@@ -187,7 +185,7 @@ mod tests {
         let handlers: server::HandlerFunction = |_| -> Box<dyn Sendable + 'static> {
             Box::new(server::Page::new(200, String::from("Hello World!")))
         };
-        let mut server = server::Webserver::new(10, vec![cargo_lock.clone()], handlers.clone());
+        let mut server = server::Webserver::new(10, vec![cargo_lock.clone()]);
         server.add_route("/", handlers.clone());
         server.add_route("/sleep", handlers.clone());
         server.add_route("/image.jpg", handlers.clone());
