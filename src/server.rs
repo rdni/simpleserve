@@ -4,7 +4,7 @@
 //! 
 //! ## Example
 //! ```
-//! use sserve::server::{
+//! use simpleserve::server::{
 //!     Webserver,
 //!     Page,
 //!     Sendable,
@@ -43,9 +43,17 @@ use std::{
     },
     fs::File,
     error::Error,
+    sync::mpsc::{
+        self, 
+        Receiver
+    },
 };
 
-use crate::{ThreadPool, utils};
+use crate::{
+    ThreadPool, 
+    utils,
+    Job
+};
 
 pub mod prelude {
     pub use crate::server::{
@@ -54,12 +62,17 @@ pub mod prelude {
         Bytes,
         Sendable,
         Handler,
+        RequestInfo,
         ConnectionInfo,
         ConnectionType
     };
+    pub use crate::utils::{
+        get_mime_type,
+        base_not_found_handler
+    };
 }
 
-pub trait Sendable: Send + Sync { // Can't have Sized, but should have it regardless
+pub trait Sendable: Send + Sync {
     fn render(&self) -> String;
     fn send(&self, conn: &mut ConnectionInfo) -> Result<(), std::io::Error> {
         match conn.connection_type() {
@@ -85,7 +98,7 @@ pub type HandlerFunction = fn(&RequestInfo) -> Box<dyn Sendable>;
 /// 
 /// # Examples
 /// ```
-/// use sserve::server::{Webserver, Page, Sendable};
+/// use simpleserve::server::{Webserver, Page, Sendable};
 /// 
 /// fn main() {
 ///     let mut server = Webserver::new(10, vec![], |_| -> Box<dyn Sendable> {
@@ -99,6 +112,8 @@ pub struct Webserver {
     thread_pool: ThreadPool,
     blacklisted_paths: Vec<path::PathBuf>,
     connection_type: Option<ConnectionType>,
+    whitelist_enabled: bool,
+    receiver: Option<mpsc::Receiver<Job>>,
 }
 
 impl Webserver {
@@ -113,7 +128,9 @@ impl Webserver {
             routes: vec![Handler::new("404", not_found_handler)],
             thread_pool: ThreadPool::new(thread_amount),
             blacklisted_paths,
-            connection_type: None
+            connection_type: None,
+            whitelist_enabled: false,
+            receiver: None,
         }
     }
 
@@ -123,6 +140,19 @@ impl Webserver {
 
     pub fn connection_type(&self) -> &Option<ConnectionType> {
         &self.connection_type
+    }
+
+    pub fn whitelist_enabled(&self) -> bool {
+        self.whitelist_enabled
+    }
+
+    pub fn set_whitelist_enabled(&mut self, enabled: bool) {
+        self.whitelist_enabled = enabled;
+    }
+
+    pub fn with_receiver(mut self, receiver: mpsc::Receiver<Job>) -> Webserver {
+        self.receiver = Some(receiver);
+        self
     }
 
     /// Adds a route to the webserver
@@ -141,7 +171,7 @@ impl Webserver {
     ///     fs,
     ///     path::PathBuf
     /// };
-    /// use sserve::server::{
+    /// use simpleserve::server::{
     ///     Webserver,
     ///     Page,
     ///     Sendable,
@@ -289,7 +319,7 @@ impl Handler {
 ///     fs,
 ///     path::PathBuf
 /// };
-/// use sserve::server::{
+/// use simpleserve::server::{
 ///     Webserver,
 ///     Page,
 ///     Sendable,
@@ -341,7 +371,7 @@ impl Sendable for Page {
 ///     fs,
 ///     path::PathBuf
 /// };
-/// use sserve::server::{
+/// use simpleserve::server::{
 ///     Webserver,
 ///     Bytes,
 ///     Sendable,

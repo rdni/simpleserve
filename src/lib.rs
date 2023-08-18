@@ -5,7 +5,7 @@
 //! 
 //! ## Example
 //! ```
-//! use sserve::server::{
+//! use simpleserve::server::{
 //!    Webserver,
 //!    Page,
 //!    Sendable,
@@ -44,7 +44,7 @@ pub use server::prelude::*;
 /// 
 /// ## Example
 /// ```
-/// use sserve::ThreadPool;
+/// use simpleserve::ThreadPool;
 /// 
 /// let pool = ThreadPool::new(4);
 /// 

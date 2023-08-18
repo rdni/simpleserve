@@ -1,5 +1,5 @@
 [package]
-name = "sserve"
+name = "simpleserve"
 version = "0.1.1"
 edition = "2021"
 

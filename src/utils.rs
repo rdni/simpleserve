@@ -11,7 +11,7 @@ use std::{
     },
     path, 
     error::Error,
-    fs::File,
+    fs::{self, File},
 };
 
 use crate::errors;
@@ -169,4 +169,20 @@ fn handle_https_file(request: &RequestInfo) -> Box<dyn Sendable> {
     let mut contents = String::new();
     file.read_to_string(&mut contents).unwrap();
     Box::new(Bytes::new(200, contents).unwrap())
+}
+
+pub fn base_not_found_handler(request: &RequestInfo) -> Box<dyn Sendable> {
+    // Check if it is a file that can be opened
+    if let Ok(bytes) = Bytes::new(200, &request.route[1..]) {
+        for path in request.blacklisted_paths {
+            if path == bytes.file_location() {
+                return Box::new(Page::new(403, String::from("Forbidden")));
+            }
+        }
+        println!("Sending file: {}", bytes.file_location().to_str().unwrap());
+        Box::new(bytes)
+    } else {
+        let content = fs::read_to_string("404.html").unwrap();
+        Box::new(Page::new(404, content))
+    }
 }

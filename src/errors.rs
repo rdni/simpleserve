@@ -6,7 +6,7 @@ use std::{error::Error, fmt::Display};
 /// 
 /// # Examples
 /// ```
-/// use sserve::errors::OptionUnwrapError;
+/// use simpleserve::errors::OptionUnwrapError;
 /// 
 /// fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///     let option: Option<u32> = Some(54);
