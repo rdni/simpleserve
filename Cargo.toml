@@ -7,7 +7,7 @@ edition = "2021"
 
 [dependencies]
 async-trait = "0.1.73"
-openssl = "0.10.56"
+openssl = "0.10.60"
 regex = "1.9.3"
 tokio = { version = "1", features = ["full"] }
 tokio-openssl = "0.6.3"
